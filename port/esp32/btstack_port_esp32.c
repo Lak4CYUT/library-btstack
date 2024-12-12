@@ -52,12 +52,17 @@
 #include "btstack_run_loop.h"
 #include "btstack_run_loop_freertos.h"
 #include "btstack_ring_buffer.h"
+#include "btstack_tlv.h"
+#include "btstack_tlv_esp32.h"
+#include "ble/le_device_db_tlv.h"
+#include "classic/btstack_link_key_db.h"
+#include "classic/btstack_link_key_db_tlv.h"
 #include "hci.h"
+#include "hci_dump.h"
 #include "esp_bt.h"
-#include "esp_system.h"
-#include "nvs.h"
-#include "nvs_flash.h"
 #include "btstack_debug.h"
+#include "btstack_audio.h"
+#include "btstack_port_esp32.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -98,7 +103,7 @@ static btstack_data_source_t transport_data_source;
 static int                   transport_signal_sent;
 static int                   transport_packets_to_deliver;
 
-// TODO: remove once stable 
+// TODO: remove once stable
 void report_recv_called_from_isr(void){
      printf("host_recv_pkt_cb called from ISR!\n");
 }
@@ -221,11 +226,13 @@ static int bt_controller_initialized;
 static int transport_open(void){
     esp_err_t ret;
 
+    log_info("transport_open");
+
     btstack_ring_buffer_init(&hci_ringbuffer, hci_ringbuffer_storage, sizeof(hci_ringbuffer_storage));
 
     // http://esp-idf.readthedocs.io/en/latest/api-reference/bluetooth/controller_vhci.html (2017104)
     // - "esp_bt_controller_init: ... This function should be called only once, before any other BT functions are called."
-    // - "esp_bt_controller_deinit" .. This function should be called only once, after any other BT functions are called. 
+    // - "esp_bt_controller_deinit" .. This function should be called only once, after any other BT functions are called.
     //    This function is not whole completed, esp_bt_controller_init cannot called after this function."
     // -> esp_bt_controller_init can only be called once after boot
     if (!bt_controller_initialized){
@@ -277,6 +284,8 @@ static int transport_open(void){
  * close transport connection
  */
 static int transport_close(void){
+    log_info("transport_close");
+
     // disable controller
     esp_bt_controller_disable();
     return 0;
@@ -286,6 +295,7 @@ static int transport_close(void){
  * register packet handler for HCI packets: ACL, SCO, and Events
  */
 static void transport_register_packet_handler(void (*handler)(uint8_t packet_type, uint8_t *packet, uint16_t size)){
+    log_info("transport_register_packet_handler");
     transport_packet_handler = handler;
 }
 
@@ -350,6 +360,32 @@ static const hci_transport_t * transport_get_instance(void){
     return &transport;
 }
 
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+
+static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+    if (packet_type != HCI_EVENT_PACKET) return;
+    switch(hci_event_packet_get_type(packet)){
+        case BTSTACK_EVENT_STATE:
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+#ifdef ENABLE_SCO_OVER_HCI
+                esp_err_t ret = esp_bredr_sco_datapath_set(ESP_SCO_DATA_PATH_HCI);
+                log_info("transport: configure SCO over HCI, result 0x%04x", ret);
+#endif
+                bd_addr_t addr;
+                gap_local_bd_addr(addr);
+                printf("BTstack up and running at %s\n",  bd_addr_to_str(addr));
+            }
+            break;
+        case HCI_EVENT_COMMAND_COMPLETE:
+            if (hci_event_command_complete_get_command_opcode(packet) == HCI_OPCODE_HCI_READ_LOCAL_VERSION_INFORMATION){
+                // @TODO
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 uint8_t btstack_init(void){
     // Setup memory pools and run loop
     btstack_memory_init();
@@ -358,15 +394,28 @@ uint8_t btstack_init(void){
     // init HCI
     hci_init(transport_get_instance(), NULL);
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-	    log_info("Error (0x%04x) init flash", err);
-        // NVS partition was truncated and needs to be erased
-        // Retry nvs_flash_init
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK( err );
+    // setup TLV ESP32 implementation and register with system
+    const btstack_tlv_t * btstack_tlv_impl = btstack_tlv_esp32_get_instance();
+    btstack_tlv_set_instance(btstack_tlv_impl, NULL);
+
+#ifdef ENABLE_CLASSIC
+    // setup Link Key DB using TLV
+    const btstack_link_key_db_t * btstack_link_key_db = btstack_link_key_db_tlv_get_instance(btstack_tlv_impl, NULL);
+    hci_set_link_key_db(btstack_link_key_db);
+#endif
+
+#ifdef ENABLE_BLE
+    // setup LE Device DB using TLV
+    le_device_db_tlv_configure(btstack_tlv_impl, NULL);
+#endif
+
+    // inform about BTstack state
+    hci_event_callback_registration.callback = &packet_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+
+    // setup i2s audio for sink and source
+    btstack_audio_sink_set_instance(btstack_audio_esp32_sink_get_instance());
+    btstack_audio_source_set_instance(btstack_audio_esp32_source_get_instance());
 
     return ERROR_CODE_SUCCESS;
 }

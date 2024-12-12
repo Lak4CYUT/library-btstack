@@ -86,7 +86,7 @@ static int btstack_tlv_esp32_get_tag(void * context, uint32_t tag, uint8_t * buf
 }
 
 /**
- * Store Tag 
+ * Store Tag
  * @param tag
  * @param data
  * @param data_size
@@ -159,4 +159,3 @@ const btstack_tlv_t * btstack_tlv_esp32_get_instance(void){
 	}
 	return &btstack_tlv_esp32;
 }
-
